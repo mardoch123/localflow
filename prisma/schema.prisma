@@ -1,0 +1,238 @@
+// LocaFlow - Schéma Prisma (PostgreSQL / Neon)
+// Domaine : gestion locative (propriétaires, locataires, admins)
+
+generator client {
+  provider      = "prisma-client-js"
+  // Engine Linux en plus de l'engine native : requis par le runtime
+  // serverless Node 20/22 de Vercel (OpenSSL 3.x).
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── ENUMS ───────────────────────────
+
+enum Role {
+  TENANT
+  LANDLORD
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum PropertyStatus {
+  AVAILABLE
+  OCCUPIED
+  VACANT
+  MAINTENANCE
+}
+
+enum ContractStatus {
+  ACTIVE
+  EXPIRING
+  EXPIRED
+  TERMINATED
+}
+
+enum PaymentStatus {
+  PAID
+  PENDING
+  OVERDUE
+  FAILED
+}
+
+enum InventoryType {
+  ENTRY // état des lieux d'entrée (emménagement)
+  EXIT  // état des lieux de sortie (départ)
+}
+
+enum InventoryStatus {
+  DRAFT // en cours de rédaction / signature
+  SIGNED // contresigné par les deux parties
+}
+
+// ─────────────────────────── MODELES ───────────────────────────
+
+model User {
+  id        String     @id @default(uuid())
+  email     String     @unique
+  password  String // hash bcrypt
+  name      String
+  phone     String?
+  role      Role       @default(TENANT)
+  status    UserStatus @default(ACTIVE)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  ownedProperties  Property[]              @relation("LandlordProperties")
+  tenantContracts  Contract[]              @relation("TenantContracts")
+  landlordContracts Contract[]             @relation("LandlordContracts")
+  payments         Payment[]               @relation("TenantPayments")
+  notifications    Notification[]
+  paymentProviders PaymentProviderConfig[]
+
+  // Réglages d'impression thermique (propriétaire) — 58mm ou 80mm
+  printerWidth      String  @default("80mm")
+  autoPrintReceipt  Boolean @default(true)
+
+  @@index([role])
+}
+
+model Property {
+  id          String         @id @default(uuid())
+  name        String
+  address     String
+  city        String?
+  type        String // "Appartement 3 pièces", "Villa 5 pièces"...
+  monthlyRent Int // FCFA
+  status      PropertyStatus @default(AVAILABLE)
+  imageUrl    String?
+  imageLabel  String?
+  description String?
+  area        String? // "85 m²"
+  rooms       Int?
+  ageYears    String? // "5 ans"
+  visitors    Int          @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  ownerId   String
+  owner     User       @relation("LandlordProperties", fields: [ownerId], references: [id], onDelete: Cascade)
+  contracts Contract[]
+  payments  Payment[]
+
+  @@index([ownerId])
+  @@index([status])
+}
+
+model Contract {
+  id            String         @id @default(uuid())
+  reference     String         @unique // "C-2026-001"
+  monthlyRent   Int // FCFA
+  depositAmount Int // FCFA
+  depositPaid   Boolean        @default(false)
+  startDate     DateTime
+  endDate       DateTime
+  status        ContractStatus @default(ACTIVE)
+  signedAt      DateTime? // null = contrat en attente de signature par le locataire
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  tenantId   String
+  tenant     User     @relation("TenantContracts", fields: [tenantId], references: [id])
+  landlordId String
+  landlord   User     @relation("LandlordContracts", fields: [landlordId], references: [id])
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  payments   Payment[]
+  inventories Inventory[]
+
+  @@index([tenantId])
+  @@index([landlordId])
+  @@index([propertyId])
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  reference      String        @unique // "PAY-2026-0847"
+  amount         Int // FCFA
+  commissionAmount Int         @default(0) // Commission plateforme 1 % — à la charge du propriétaire
+  method         String? // "FeexPay", "FedaPay"...
+  status         PaymentStatus @default(PENDING)
+  dueDate        DateTime
+  paidAt         DateTime?
+  period         String // "2026-10" (mois de loyer concerné)
+  createdAt      DateTime      @default(now())
+
+  contractId String
+  contract   Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  propertyId String
+  property   Property @relation(fields: [propertyId], references: [id])
+  tenantId   String
+  tenant     User     @relation("TenantPayments", fields: [tenantId], references: [id])
+
+  @@index([contractId])
+  @@index([tenantId])
+  @@index([status])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  title     String
+  body      String?
+  type      String   @default("info") // info | payment | contract | maintenance
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PaymentProviderConfig {
+  id           String   @id @default(uuid())
+  provider     String // "feexpay" | "fedapay" | "kkiapay"
+  name         String
+  description  String?
+  icon         String?
+  enabled      Boolean  @default(false)
+  connected    Boolean  @default(false)
+  apiKeyMasked String?
+  transactions Int      @default(0)
+  volume       Int      @default(0) // FCFA cumulé
+  primaryColor String   @default("#1B6CA8") // couleur hex #RRGGBB
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+}
+
+// ─────────────── ÉTAT DES LIEUX (inventaire de conformité) ───────────────
+// Rattaché à un contrat : un état des lieux d'ENTRÉE (emménagement) et de
+// SORTIE (départ). Chaque document est composé d'items par pièce/chambre.
+
+model Inventory {
+  id            String          @id @default(uuid())
+  reference     String          @unique // "EDL-E-2026-001" / "EDL-S-2026-001"
+  type          InventoryType
+  status        InventoryStatus @default(DRAFT)
+  date          DateTime        @default(now())
+  notes         String? // observations générales (propriétaire)
+  tenantNotes   String? // réserves éventuelles du locataire
+  waterMeter    String? // relevé compteur d'eau
+  electricMeter String? // relevé compteur d'électricité
+  keysCount     Int             @default(0) // nombre de jeux de clés remis
+  signedByTenant   Boolean @default(false)
+  signedByLandlord Boolean @default(false)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  contractId String
+  contract   Contract        @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  items      InventoryItem[]
+
+  @@index([contractId])
+}
+
+model InventoryItem {
+  id          String  @id @default(uuid())
+  room        String // "Chambre 1", "Cuisine", "Salle de bain"…
+  element     String? // "Sol", "Murs", "Fenêtre", "Roof"…
+  condition   String  @default("Bon") // Neuf | Bon | Usage | Endommagé
+  observation String?
+
+  inventoryId String
+  inventory   Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+
+  @@index([inventoryId])
+}
